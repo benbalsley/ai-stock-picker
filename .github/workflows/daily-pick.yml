@@ -2,7 +2,7 @@ name: Daily Stock Pick
 
 on:
   schedule:
-    # Runs at 14:00 UTC Monday–Friday (9am ET in standard time).
+    # Runs at 14:00 UTC Monday–Friday (roughly 9am ET in standard time).
     - cron: '0 14 * * 1-5'
   workflow_dispatch: {}
 
