@@ -1,0 +1,32 @@
+name: Daily Stock Pick
+
+on:
+  schedule:
+    # Runs at 14:00 UTC Monday–Friday (9am ET in standard time).
+    - cron: '0 14 * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  daily-pick:
+    runs-on: ubuntu-latest
+
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run daily picker
+        run: python ai_stock_picker.py
+
