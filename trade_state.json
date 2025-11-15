@@ -1,0 +1,23 @@
+{
+  "date": "2025-11-14",
+  "ticker": "UNH",
+  "trend": "short",
+  "side": "SELL",
+  "label": "SHORT",
+  "entry": 321.22,
+  "stop": 338.39,
+  "target1": 286.87,
+  "target2": 269.7,
+  "atr": 11.448564801897321,
+  "atr_pct": 3.56,
+  "risk_rating": "HIGH",
+  "qty": 1,
+  "active": true,
+  "stop_alert_sent": false,
+  "t1_alert_sent": false,
+  "t2_alert_sent": false,
+  "eod_alert_sent": false,
+  "last_price": null,
+  "last_check": null,
+  "news_ids": []
+}
