@@ -5,7 +5,6 @@ import csv
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import pandas_market_calendars as mcal
 
 from config import ACCOUNT_EQUITY, RISK_PER_TRADE_PCT, UNIVERSE_FILE
 
@@ -50,6 +49,16 @@ def download_history_for_universe(tickers, start, end):
     return data
 
 
+def get_spy_trading_days(start, end):
+    """
+    Use SPY daily data as the trading calendar (simpler & robust).
+    """
+    df = yf.download("SPY", start=start, end=end, progress=False, auto_adjust=False)
+    if df.empty:
+        raise RuntimeError("Could not get SPY history to build trading calendar.")
+    return list(df.index.date)
+
+
 def calc_atr(df, period=14):
     """Average True Range."""
     high = df["High"]
@@ -66,7 +75,7 @@ def calc_atr(df, period=14):
 
 
 ############################################################
-# Scoring logic (mirrors live picker V1)
+# Scoring logic (mirror live picker V1)
 ############################################################
 
 def score_on_date(ticker, df, date):
@@ -84,25 +93,24 @@ def score_on_date(ticker, df, date):
 
     close = df_up_to["Close"]
 
-    # last two closes as of this date
-    last_close = close.iloc[-1]
-    prev_close = close.iloc[-2]
+    last_close = float(close.iloc[-1])
+    prev_close = float(close.iloc[-2])
 
     ma20_series = close.rolling(20).mean()
-    ma20 = ma20_series.iloc[-1]
+    ma20 = float(ma20_series.iloc[-1])
 
     # Trend filter
     trend = "long" if last_close > ma20 else "short"
 
     atr_series = calc_atr(df_up_to)
-    atr = atr_series.iloc[-1]
-    if pd.isna(atr) or atr <= 0:
+    atr = float(atr_series.iloc[-1])
+    if np.isnan(atr) or atr <= 0:
         return None
 
     # Gap between last and previous close
     gap_pct = (last_close - prev_close) / prev_close
 
-    # Minimum gap requirement (≈0.5%)
+    # Minimum gap requirement (~0.5%)
     if abs(gap_pct) < 0.005:
         return None
 
@@ -136,7 +144,7 @@ def score_on_date(ticker, df, date):
 ############################################################
 
 def build_position_size(signal):
-    """Same risk-based sizing logic: use ATR and account size."""
+    """Risk-based sizing logic: use ATR and account size."""
     price = signal["price"]
     atr = signal["atr"]
     risk_dollars = ACCOUNT_EQUITY * RISK_PER_TRADE_PCT
@@ -163,7 +171,6 @@ def simulate_trade_for_day(signal_date, signal, df, trading_days):
     - Exit at SAME day close
     - Return PnL and record
     """
-    # Find index of signal_date in trading_days and the next trading day for the actual trade
     try:
         idx = trading_days.index(signal_date)
     except ValueError:
@@ -175,7 +182,7 @@ def simulate_trade_for_day(signal_date, signal, df, trading_days):
 
     trade_date = trading_days[idx + 1]  # we trade on next session
 
-    # Pull row for trade_date from df
+    # Row for trade_date from df
     df_trade = df[df.index.date == trade_date]
     if df_trade.empty:
         return None
@@ -232,15 +239,16 @@ def run_backtest(days_back=252, output_file="backtest_results.csv"):
     print(f"[INFO] Backtest window (signals): last {days_back} trading days")
     print(f"[INFO] History pulled from {start_date} to {end_date}")
 
-    # Market calendar for NYSE
-    nyse = mcal.get_calendar("XNYS")
-    schedule = nyse.schedule(start_date=start_date, end_date=end_date)
-    trading_days = list(schedule.index.date)
-
+    # Trading calendar from SPY
+    trading_days = get_spy_trading_days(start_date, end_date)
     if len(trading_days) < days_back + 10:
-        print("[WARN] Few trading days returned; NYSE calendar may not be aligned.")
+        print("[WARN] Fewer trading days than expected; check SPY data.")
+
     # Use the last `days_back` days as the signal dates
-    signal_days = trading_days[-(days_back + 1):-1]  # leave last day for next-day trade
+    if len(trading_days) <= days_back + 1:
+        signal_days = trading_days[:-1]
+    else:
+        signal_days = trading_days[-(days_back + 1):-1]  # leave last day for next trade
 
     universe = load_universe()
     if not universe:
