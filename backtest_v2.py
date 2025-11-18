@@ -10,7 +10,7 @@ from config import ACCOUNT_EQUITY, RISK_PER_TRADE_PCT, UNIVERSE_FILE
 
 
 ############################################################
-# Shared helpers (copied from V2 logic)
+# Load Universe
 ############################################################
 
 def load_universe():
@@ -22,6 +22,10 @@ def load_universe():
         print(f"Universe file '{UNIVERSE_FILE}' not found.")
         return []
 
+
+############################################################
+# Fetch + Indicators
+############################################################
 
 def fetch(ticker, start, end):
     """Download daily bars for a ticker."""
@@ -52,10 +56,14 @@ def calc_atr(df, period=14):
     return atr
 
 
+############################################################
+# FIXED + CLEAN — MARKET REGIME LOGIC (SCALAR ONLY)
+############################################################
+
 def get_market_regime(end_date: dt.date, lookback_days: int = 40):
     """
     Use SPY & QQQ to determine if the market is supportive for LONGS.
-    Returns dict with trend flags and a 'allow_longs' boolean.
+    Clean scalar-only version (no ambiguous Series comparisons).
     """
     start = end_date - dt.timedelta(days=lookback_days)
 
@@ -69,46 +77,40 @@ def get_market_regime(end_date: dt.date, lookback_days: int = 40):
     spy_close = spy["Close"]
     qqq_close = qqq["Close"]
 
-    spy_ma20 = spy_close.rolling(20).mean().iloc[-1]
-    qqq_ma20 = qqq_close.rolling(20).mean().iloc[-1]
+    spy_last = float(spy_close.iloc[-1])
+    qqq_last = float(qqq_close.iloc[-1])
 
-    spy_last = spy_close.iloc[-1]
-    qqq_last = qqq_close.iloc[-1]
+    spy_ma20 = float(spy_close.rolling(20).mean().iloc[-1])
+    qqq_ma20 = float(qqq_close.rolling(20).mean().iloc[-1])
 
-    spy_ret = (spy_last - spy_close.iloc[-2]) / spy_close.iloc[-2]
-    qqq_ret = (qqq_last - qqq_close.iloc[-2]) / qqq_close.iloc[-2]
+    spy_ret = float((spy_last - spy_close.iloc[-2]) / spy_close.iloc[-2])
+    qqq_ret = float((qqq_last - qqq_close.iloc[-2]) / qqq_close.iloc[-2])
 
-    spy_up_trend = spy_last > spy_ma20
-    qqq_up_trend = qqq_last > qqq_ma20
+    spy_up = spy_last > spy_ma20
+    qqq_up = qqq_last > qqq_ma20
 
-    spy_range_pct = (spy["High"].iloc[-1] - spy["Low"].iloc[-1]) / spy_last
-    qqq_range_pct = (qqq["High"].iloc[-1] - qqq["Low"].iloc[-1]) / qqq_last
+    spy_range_pct = float((spy["High"].iloc[-1] - spy["Low"].iloc[-1]) / spy_last)
+    qqq_range_pct = float((qqq["High"].iloc[-1] - qqq["Low"].iloc[-1]) / qqq_last)
 
-    chop = (spy_range_pct < 0.002 and qqq_range_pct < 0.002)
+    chop = (spy_range_pct < 0.002) and (qqq_range_pct < 0.002)
 
-    allow_longs = (
-        spy_up_trend and qqq_up_trend and spy_ret > 0 and qqq_ret > 0 and not chop
-    )
+    allow_longs = (spy_up and qqq_up and spy_ret > 0 and qqq_ret > 0 and not chop)
 
     return {
         "allow_longs": allow_longs,
-        "spy_up_trend": spy_up_trend,
-        "qqq_up_trend": qqq_up_trend,
+        "spy_up_trend": spy_up,
+        "qqq_up_trend": qqq_up,
         "spy_ret": spy_ret,
         "qqq_ret": qqq_ret,
         "chop": chop,
     }
 
 
+############################################################
+# V2 Institutional Scoring
+############################################################
+
 def score_ticker_v2(ticker: str, as_of: dt.date, df: pd.DataFrame):
-    """
-    V2 institutional-style scoring for a single ticker as of 'as_of' date.
-    Long-only, with:
-      - Gap sweet spot (0.8%–3.5%)
-      - Volume filter (avg > 1M)
-      - Relative volume filter (>1.2 preferred)
-      - Trend filter vs MA20
-    """
     df_up_to = df[df.index.date <= as_of].copy()
     df_up_to = df_up_to.dropna()
 
@@ -130,18 +132,18 @@ def score_ticker_v2(ticker: str, as_of: dt.date, df: pd.DataFrame):
 
     gap_pct = (last_close - prev_close) / prev_close
 
-    # Sweet spot: 0.8%–3.5% gap up for longs
+    # Institutional sweet spot: 0.8%–3.5% gap
     if not (0.008 <= gap_pct <= 0.035):
         return None
 
-    # Trend: require price > MA20 for long bias
+    # Trend requirement
     if last_close <= ma20:
         return None
 
     avg_vol20 = float(vol.rolling(20).mean().iloc[-1])
     today_vol = float(vol.iloc[-1])
 
-    if avg_vol20 < 1_000_000:  # illiquid → skip
+    if avg_vol20 < 1_000_000:
         return None
 
     rel_vol = today_vol / avg_vol20 if avg_vol20 > 0 else 0.0
@@ -152,10 +154,8 @@ def score_ticker_v2(ticker: str, as_of: dt.date, df: pd.DataFrame):
 
     score = 0.0
 
-    # Gap size within sweet spot (peak preference around 1.5–2.5%)
     score += 40.0 * min(gap_pct * 100.0 / 2.0, 3.0)
 
-    # Relative volume
     if rel_vol >= 2.0:
         score += 25.0
     elif rel_vol >= 1.5:
@@ -165,7 +165,6 @@ def score_ticker_v2(ticker: str, as_of: dt.date, df: pd.DataFrame):
     else:
         score -= 10.0
 
-    # Volatility: modest reward (not too low, not insane)
     if 1.0 <= vol_score <= 4.0:
         score += 10.0
     elif vol_score > 6.0:
@@ -191,7 +190,7 @@ def score_ticker_v2(ticker: str, as_of: dt.date, df: pd.DataFrame):
 
 
 ############################################################
-# Backtest helpers
+# Backtest Helpers
 ############################################################
 
 def download_history_for_universe(tickers, start, end):
@@ -265,13 +264,11 @@ def simulate_trade_for_day(signal_date, signal, df, trading_days):
     if qty is None:
         return None
 
-    direction = 1  # long-only
-
-    pnl_per_share = (close_px - open_px) * direction
+    pnl_per_share = (close_px - open_px)
     pnl_dollars = pnl_per_share * qty
     pnl_pct = pnl_dollars / ACCOUNT_EQUITY * 100.0
 
-    record = {
+    return {
         "signal_date": signal_date.isoformat(),
         "trade_date": trade_date.isoformat(),
         "ticker": signal["ticker"],
@@ -287,11 +284,10 @@ def simulate_trade_for_day(signal_date, signal, df, trading_days):
         "vol_score": round(signal["vol_score"], 4),
         "score": round(signal["score"], 4),
     }
-    return record
 
 
 ############################################################
-# Backtest driver
+# Main Backtest Loop
 ############################################################
 
 def run_backtest_v2(days_back=252, output_file="backtest_results_v2.csv"):
@@ -301,12 +297,10 @@ def run_backtest_v2(days_back=252, output_file="backtest_results_v2.csv"):
     start_date = today - dt.timedelta(days=days_back + history_buffer_days)
     end_date = today
 
-    print(f"[INFO] V2 Backtest window (signals): last {days_back} trading days")
-    print(f"[INFO] History pulled from {start_date} to {end_date}")
+    print(f"[INFO] V2 Backtest window: last {days_back} trading days")
+    print(f"[INFO] Pulling history {start_date} → {end_date}")
 
     trading_days = get_spy_trading_days(start_date, end_date)
-    if len(trading_days) < days_back + 10:
-        print("[WARN] Fewer trading days than expected; check SPY data.")
 
     if len(trading_days) <= days_back + 1:
         signal_days = trading_days[:-1]
@@ -315,37 +309,29 @@ def run_backtest_v2(days_back=252, output_file="backtest_results_v2.csv"):
 
     universe = load_universe()
     if not universe:
-        print("[ERROR] Universe is empty. Aborting V2 backtest.")
+        print("[ERROR] Universe is empty. Aborting backtest.")
         return
 
-    print(f"[INFO] Universe size: {len(universe)} tickers")
+    print(f"[INFO] Universe: {len(universe)} tickers")
 
     all_data = download_history_for_universe(universe, start_date, end_date)
 
     fieldnames = [
-        "signal_date",
-        "trade_date",
-        "ticker",
-        "trend",
-        "entry_price",
-        "exit_price",
-        "qty",
-        "pnl_dollars",
-        "pnl_pct",
-        "gap_pct",
-        "atr",
-        "rel_vol",
-        "vol_score",
-        "score",
+        "signal_date", "trade_date", "ticker", "trend",
+        "entry_price", "exit_price", "qty",
+        "pnl_dollars", "pnl_pct",
+        "gap_pct", "atr", "rel_vol", "vol_score", "score",
     ]
+
     records = []
 
     for d in signal_days:
-        print(f"\n[DAY] {d} – computing V2 signal...")
+        print(f"\n[DAY] {d} — computing V2 signal...")
 
+        # Market regime
         regime = get_market_regime(d)
-        if not regime.get("allow_longs", True):
-            print("[DAY] Regime says no longs today; skipping.")
+        if not regime["allow_longs"]:
+            print("[DAY] Market regime blocked longs today.")
             continue
 
         best_signal = None
@@ -354,8 +340,9 @@ def run_backtest_v2(days_back=252, output_file="backtest_results_v2.csv"):
             try:
                 info = score_ticker_v2(t, d, df)
             except Exception as e:
-                print(f"[WARN] scoring error for {t} on {d}: {e}")
+                print(f"[WARN] Score failed for {t} on {d}: {e}")
                 continue
+
             if info is None:
                 continue
 
@@ -363,17 +350,18 @@ def run_backtest_v2(days_back=252, output_file="backtest_results_v2.csv"):
                 best_signal = info
 
         if best_signal is None:
-            print(f"[DAY] {d}: no V2 candidate passed filters.")
+            print(f"[DAY] {d}: No V2 signals passed filters.")
             continue
 
         df_t = all_data[best_signal["ticker"]]
         rec = simulate_trade_for_day(d, best_signal, df_t, trading_days)
+
         if rec is None:
-            print(f"[DAY] {d}: could not simulate trade for {best_signal['ticker']}")
+            print(f"[DAY] {d}: trade simulation failed.")
             continue
 
         print(
-            f"[TRADE] {rec['trade_date']} {rec['ticker']} LONG "
+            f"[TRADE] {rec['trade_date']} {rec['ticker']} "
             f"entry={rec['entry_price']} exit={rec['exit_price']} "
             f"PnL=${rec['pnl_dollars']} ({rec['pnl_pct']}%)"
         )
@@ -384,30 +372,25 @@ def run_backtest_v2(days_back=252, output_file="backtest_results_v2.csv"):
         with open(output_file, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            for r in records:
-                writer.writerow(r)
-        print(f"\n[RESULT] V2 backtest written to {output_file}")
+            writer.writerows(records)
+
+        print(f"\n[RESULT] Backtest V2 written to {output_file}")
     else:
-        print("\n[RESULT] No V2 trades generated. Nothing written.")
+        print("\n[RESULT] No V2 trades generated.")
         return
 
+    # Summary
     pnl_series = [r["pnl_dollars"] for r in records]
     wins = [p for p in pnl_series if p > 0]
     losses = [p for p in pnl_series if p <= 0]
 
-    total_pnl = round(sum(pnl_series), 2)
-    total_return_pct = round(sum(r["pnl_pct"] for r in records), 2)
-    win_rate = round(len(wins) / len(records) * 100.0, 2) if records else 0.0
-    avg_win = round(np.mean(wins), 2) if wins else 0.0
-    avg_loss = round(np.mean(losses), 2) if losses else 0.0
-
     print("\n========== V2 BACKTEST SUMMARY ==========")
     print(f"Trades:        {len(records)}")
-    print(f"Win rate:      {win_rate}%")
-    print(f"Total PnL:     ${total_pnl}")
-    print(f"Total Return:  {total_return_pct}% of account")
-    print(f"Avg Win:       ${avg_win}")
-    print(f"Avg Loss:      ${avg_loss}")
+    print(f"Win rate:      {len(wins) / len(records) * 100:.2f}%")
+    print(f"Total PnL:     ${sum(pnl_series):.2f}")
+    print(f"Total Return:  {sum(r['pnl_pct'] for r in records):.2f}% of account")
+    print(f"Avg Win:       ${np.mean(wins):.2f}" if wins else "Avg Win:       N/A")
+    print(f"Avg Loss:      ${np.mean(losses):.2f}" if losses else "Avg Loss:      N/A")
     print("===========================================")
 
 
