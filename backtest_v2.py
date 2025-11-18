@@ -6,24 +6,195 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from config import ACCOUNT_EQUITY, RISK_PER_TRADE_PCT
-from ai_stock_picker_v2 import (
-    load_universe,
-    fetch,
-    score_ticker_v2,
-    get_market_regime,
-)
+from config import ACCOUNT_EQUITY, RISK_PER_TRADE_PCT, UNIVERSE_FILE
 
 
 ############################################################
-# Helpers
+# Shared helpers (copied from V2 logic)
+############################################################
+
+def load_universe():
+    """Load tickers from universe file."""
+    try:
+        with open(UNIVERSE_FILE, "r") as f:
+            return [line.strip() for line in f.readlines() if line.strip()]
+    except FileNotFoundError:
+        print(f"Universe file '{UNIVERSE_FILE}' not found.")
+        return []
+
+
+def fetch(ticker, start, end):
+    """Download daily bars for a ticker."""
+    df = yf.download(
+        ticker,
+        start=start,
+        end=end,
+        progress=False,
+        auto_adjust=False,
+    )
+    if df is None or df.empty:
+        return None
+    return df.dropna()
+
+
+def calc_atr(df, period=14):
+    """Average True Range."""
+    high = df["High"]
+    low = df["Low"]
+    close_prev = df["Close"].shift(1)
+
+    tr1 = high - low
+    tr2 = (high - close_prev).abs()
+    tr3 = (low - close_prev).abs()
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
+
+
+def get_market_regime(end_date: dt.date, lookback_days: int = 40):
+    """
+    Use SPY & QQQ to determine if the market is supportive for LONGS.
+    Returns dict with trend flags and a 'allow_longs' boolean.
+    """
+    start = end_date - dt.timedelta(days=lookback_days)
+
+    spy = fetch("SPY", start, end_date)
+    qqq = fetch("QQQ", start, end_date)
+
+    if spy is None or qqq is None or len(spy) < 20 or len(qqq) < 20:
+        print("[WARN] Could not get full SPY/QQQ data, defaulting to neutral regime.")
+        return {"allow_longs": True}
+
+    spy_close = spy["Close"]
+    qqq_close = qqq["Close"]
+
+    spy_ma20 = spy_close.rolling(20).mean().iloc[-1]
+    qqq_ma20 = qqq_close.rolling(20).mean().iloc[-1]
+
+    spy_last = spy_close.iloc[-1]
+    qqq_last = qqq_close.iloc[-1]
+
+    spy_ret = (spy_last - spy_close.iloc[-2]) / spy_close.iloc[-2]
+    qqq_ret = (qqq_last - qqq_close.iloc[-2]) / qqq_close.iloc[-2]
+
+    spy_up_trend = spy_last > spy_ma20
+    qqq_up_trend = qqq_last > qqq_ma20
+
+    spy_range_pct = (spy["High"].iloc[-1] - spy["Low"].iloc[-1]) / spy_last
+    qqq_range_pct = (qqq["High"].iloc[-1] - qqq["Low"].iloc[-1]) / qqq_last
+
+    chop = (spy_range_pct < 0.002 and qqq_range_pct < 0.002)
+
+    allow_longs = (
+        spy_up_trend and qqq_up_trend and spy_ret > 0 and qqq_ret > 0 and not chop
+    )
+
+    return {
+        "allow_longs": allow_longs,
+        "spy_up_trend": spy_up_trend,
+        "qqq_up_trend": qqq_up_trend,
+        "spy_ret": spy_ret,
+        "qqq_ret": qqq_ret,
+        "chop": chop,
+    }
+
+
+def score_ticker_v2(ticker: str, as_of: dt.date, df: pd.DataFrame):
+    """
+    V2 institutional-style scoring for a single ticker as of 'as_of' date.
+    Long-only, with:
+      - Gap sweet spot (0.8%–3.5%)
+      - Volume filter (avg > 1M)
+      - Relative volume filter (>1.2 preferred)
+      - Trend filter vs MA20
+    """
+    df_up_to = df[df.index.date <= as_of].copy()
+    df_up_to = df_up_to.dropna()
+
+    if len(df_up_to) < 25:
+        return None
+
+    close = df_up_to["Close"]
+    vol = df_up_to["Volume"]
+
+    last_close = float(close.iloc[-1])
+    prev_close = float(close.iloc[-2])
+
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+
+    atr_series = calc_atr(df_up_to)
+    atr = float(atr_series.iloc[-1])
+    if np.isnan(atr) or atr <= 0:
+        return None
+
+    gap_pct = (last_close - prev_close) / prev_close
+
+    # Sweet spot: 0.8%–3.5% gap up for longs
+    if not (0.008 <= gap_pct <= 0.035):
+        return None
+
+    # Trend: require price > MA20 for long bias
+    if last_close <= ma20:
+        return None
+
+    avg_vol20 = float(vol.rolling(20).mean().iloc[-1])
+    today_vol = float(vol.iloc[-1])
+
+    if avg_vol20 < 1_000_000:  # illiquid → skip
+        return None
+
+    rel_vol = today_vol / avg_vol20 if avg_vol20 > 0 else 0.0
+
+    vol_score = (atr / last_close) * 100.0
+    if vol_score < 0.5:
+        return None
+
+    score = 0.0
+
+    # Gap size within sweet spot (peak preference around 1.5–2.5%)
+    score += 40.0 * min(gap_pct * 100.0 / 2.0, 3.0)
+
+    # Relative volume
+    if rel_vol >= 2.0:
+        score += 25.0
+    elif rel_vol >= 1.5:
+        score += 15.0
+    elif rel_vol >= 1.2:
+        score += 5.0
+    else:
+        score -= 10.0
+
+    # Volatility: modest reward (not too low, not insane)
+    if 1.0 <= vol_score <= 4.0:
+        score += 10.0
+    elif vol_score > 6.0:
+        score -= 5.0
+
+    trend_strength = (last_close - ma20) / ma20
+    score += min(trend_strength * 200.0, 10.0)
+
+    return {
+        "ticker": ticker,
+        "as_of": as_of,
+        "price": last_close,
+        "gap_pct": gap_pct,
+        "ma20": ma20,
+        "atr": atr,
+        "avg_vol20": avg_vol20,
+        "today_vol": today_vol,
+        "rel_vol": rel_vol,
+        "vol_score": vol_score,
+        "trend_strength": trend_strength,
+        "score": score,
+    }
+
+
+############################################################
+# Backtest helpers
 ############################################################
 
 def download_history_for_universe(tickers, start, end):
-    """
-    Download daily history for all tickers once.
-    Returns dict: {ticker: DataFrame}
-    """
     data = {}
     for t in tickers:
         try:
@@ -46,21 +217,13 @@ def download_history_for_universe(tickers, start, end):
 
 
 def get_spy_trading_days(start, end):
-    """
-    Use SPY daily data as the trading calendar (simple & robust).
-    """
     df = yf.download("SPY", start=start, end=end, progress=False, auto_adjust=False)
     if df.empty:
         raise RuntimeError("Could not get SPY history to build trading calendar.")
     return list(df.index.date)
 
 
-############################################################
-# Trade simulation (same as V1 backtest)
-############################################################
-
 def build_position_size(signal):
-    """Risk-based sizing logic: use ATR and account size."""
     price = signal["price"]
     atr = signal["atr"]
     risk_dollars = ACCOUNT_EQUITY * RISK_PER_TRADE_PCT
@@ -81,22 +244,15 @@ def build_position_size(signal):
 
 
 def simulate_trade_for_day(signal_date, signal, df, trading_days):
-    """
-    For a given signal generated on 'signal_date':
-    - Enter at NEXT trading day's open
-    - Exit at SAME day close
-    - Return PnL and record
-    """
     try:
         idx = trading_days.index(signal_date)
     except ValueError:
-        return None  # date not in calendar
-
-    if idx + 1 >= len(trading_days):
-        # No next day data
         return None
 
-    trade_date = trading_days[idx + 1]  # we trade on next session
+    if idx + 1 >= len(trading_days):
+        return None
+
+    trade_date = trading_days[idx + 1]
 
     df_trade = df[df.index.date == trade_date]
     if df_trade.empty:
@@ -109,8 +265,7 @@ def simulate_trade_for_day(signal_date, signal, df, trading_days):
     if qty is None:
         return None
 
-    # V2 is long-only
-    direction = 1
+    direction = 1  # long-only
 
     pnl_per_share = (close_px - open_px) * direction
     pnl_dollars = pnl_per_share * qty
@@ -136,16 +291,10 @@ def simulate_trade_for_day(signal_date, signal, df, trading_days):
 
 
 ############################################################
-# Backtest driver for V2
+# Backtest driver
 ############################################################
 
 def run_backtest_v2(days_back=252, output_file="backtest_results_v2.csv"):
-    """
-    Backtest roughly 1 year of V2 signals:
-    - One signal per trading day (best candidate that passes V2 filters)
-    - Market regime filter (SPY/QQQ) applied per day
-    - Enter next day open, exit same day close
-    """
     today = dt.date.today()
 
     history_buffer_days = 90
@@ -194,7 +343,6 @@ def run_backtest_v2(days_back=252, output_file="backtest_results_v2.csv"):
     for d in signal_days:
         print(f"\n[DAY] {d} – computing V2 signal...")
 
-        # Market regime filter for that day
         regime = get_market_regime(d)
         if not regime.get("allow_longs", True):
             print("[DAY] Regime says no longs today; skipping.")
