@@ -1,0 +1,5 @@
+Ticker,Direction,Entry,Stop,Target,Size,Notes
+AAPL,long,195,188,210,10,example swing trade
+TSLA,short,250,265,220,5,example short
+
+
