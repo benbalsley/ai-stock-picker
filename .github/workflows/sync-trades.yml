@@ -2,7 +2,7 @@ name: Sync Trades from Slack Reactions
 
 on:
   schedule:
-    - cron: "*/5 13-21 * * MON-FRI"  # every 5 minutes during US market-ish hours (UTC)
+    - cron: "*/1 13-21 * * MON-FRI"   # every 1 minute during US market hours
   workflow_dispatch: {}
 
 jobs:
